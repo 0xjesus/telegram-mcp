@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.db-*
+*.sqlite*
+*.session*
+*.key
+.env
+.env.*
+app.json
+media/
