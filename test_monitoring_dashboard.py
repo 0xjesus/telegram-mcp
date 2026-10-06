@@ -57,6 +57,85 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(c.execute('SELECT cursor FROM attachment_group_rescan WHERE chat_id=-1').fetchone()[0],0)
 
 
+class TelegramRecoveryStatusTests(unittest.TestCase):
+    def setUp(self):
+        DashboardTests.setUp(self)
+        self.app.enable_all()
+        with sqlite3.connect(self.paths['telegram']) as c:
+            for column in ('retry_after REAL DEFAULT 0', 'last_error TEXT', 'updated_at TEXT',
+                           'dialog_head_id INTEGER DEFAULT 0', 'incremental_id INTEGER DEFAULT 0',
+                           'incremental_checked_head_id INTEGER DEFAULT 0'):
+                c.execute('ALTER TABLE chat_sync ADD COLUMN '+column)
+            c.execute("CREATE TABLE sync_meta(key TEXT PRIMARY KEY,value TEXT)")
+            c.execute("UPDATE chat_sync SET backfill_status='done',incremental_pending=0,updated_at='2026-10-06T18:00:00Z'")
+            c.execute('DELETE FROM memory_group_rescan')
+
+    def row(self):
+        return next(r for r in self.app.inventory() if r['platform']=='telegram')
+
+    def test_finished_source_replaces_durable_queued_without_claiming_all_content(self):
+        before=self.app.recovery_status()
+        row=self.row()
+        self.assertEqual(row['recovery'],'source_history_ready')
+        self.assertEqual(row['sync']['upstream'],'history_ready')
+        self.assertFalse(row['sync']['full_content_verified'])
+        self.assertEqual(row['sync']['source_updated_at'],'2026-10-06T18:00:00Z')
+        self.assertEqual(self.app.recovery_status(),before)
+
+    def test_index_rescan_remains_visible_after_upstream_finished(self):
+        with sqlite3.connect(self.paths['telegram']) as c:
+            c.execute("INSERT INTO memory_group_rescan VALUES('-1','')")
+        row=self.row()
+        self.assertEqual(row['recovery'],'index_rescan_pending')
+        self.assertEqual(row['sync']['upstream'],'history_ready')
+        self.assertTrue(row['sync']['index_rescan_pending'])
+
+    def test_history_pending_is_distinct_from_index_rescan(self):
+        with sqlite3.connect(self.paths['telegram']) as c:
+            c.execute("UPDATE chat_sync SET backfill_status='pending'")
+        self.assertEqual(self.row()['recovery'],'source_history_pending')
+        self.assertFalse(self.row()['sync']['index_rescan_pending'])
+
+    def test_live_gap_is_visible_even_after_history_completed(self):
+        with sqlite3.connect(self.paths['telegram']) as c:
+            c.execute('UPDATE chat_sync SET dialog_head_id=25,incremental_id=20,incremental_checked_head_id=20')
+        self.assertEqual(self.row()['recovery'],'source_recent_pending')
+
+    def test_capped_or_missing_state_never_means_ready(self):
+        with sqlite3.connect(self.paths['telegram']) as c:
+            c.execute("UPDATE chat_sync SET backfill_status='capped'")
+        self.assertEqual(self.row()['recovery'],'source_history_limited')
+        with sqlite3.connect(self.paths['telegram']) as c:c.execute('DELETE FROM chat_sync')
+        self.assertEqual(self.row()['recovery'],'source_state_unknown')
+
+    def test_retry_deadline_and_error_are_visible_without_exposing_error_text(self):
+        import time
+        with sqlite3.connect(self.paths['telegram']) as c:
+            c.execute('UPDATE chat_sync SET retry_after=?,last_error=?',(time.time()+3600,'private upstream exception'))
+        self.assertEqual(self.row()['recovery'],'source_retry_wait')
+        self.assertEqual(self.row()['recovery_error'],'source_sync_error')
+        with sqlite3.connect(self.paths['telegram']) as c:c.execute('UPDATE chat_sync SET retry_after=0')
+        self.assertEqual(self.row()['recovery'],'source_sync_error')
+        self.assertNotIn('private upstream exception',str(self.row()))
+
+    def test_global_flood_wait_remains_visible_for_the_source(self):
+        import time
+        with sqlite3.connect(self.paths['telegram']) as c:
+            c.execute("INSERT INTO sync_meta VALUES('read_retry_after',?)",(str(time.time()+3600),))
+        self.assertEqual(self.row()['recovery'],'source_retry_wait')
+
+    def test_optional_memory_capture_table_can_be_absent(self):
+        with sqlite3.connect(self.paths['telegram']) as c:c.execute('DROP TABLE memory_group_rescan')
+        row=self.row()
+        self.assertEqual(row['recovery'],'source_history_ready')
+        self.assertIsNone(row['sync']['index_rescan_pending'])
+        self.assertFalse(row['sync']['full_content_verified'])
+
+    def test_disabled_group_stays_paused_when_history_is_finished(self):
+        self.app.toggle('telegram','-1',False)
+        self.assertEqual(self.row()['recovery'],'paused')
+
+
 class RecoveryPaginationTests(DashboardTests):
     def setUp(self):
         super().setUp()
