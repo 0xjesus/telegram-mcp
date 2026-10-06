@@ -8,6 +8,7 @@ Telethon) como servidor MCP HTTP para todos los agentes CLI de esta máquina.
 - Anti-ban: límites de envío, respeto de FloodWait, identidad de dispositivo tipo Desktop.
 """
 import functools
+import faulthandler, signal
 from scheduler import Queue, RetryLater, parse_time
 import asyncio, json, logging, os, sqlite3, sys, time, datetime as dt, html, re, tempfile, shutil
 from pathlib import Path
@@ -1065,4 +1066,6 @@ async def main():
         await asyncio.sleep(3600)
 
 if __name__ == "__main__":
+    if hasattr(signal,"SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1,all_threads=True)
     asyncio.run(main())
