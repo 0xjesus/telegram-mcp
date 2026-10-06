@@ -56,3 +56,19 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
   self.now+=120
   self.assertEqual(self.q.enqueue(7,'synthetic',due,idempotency_key='retry')['id'],first['id'])
   with self.assertRaises(ValueError):self.q.enqueue(7,'changed',due,idempotency_key='retry')
+
+ async def test_slow_disk_poll_does_not_block_event_loop(self):
+  import asyncio,threading
+  entered=threading.Event();release=threading.Event()
+  def blocked_claim():
+   entered.set();release.wait(2);return False
+  self.q.claim=blocked_claim
+  task=asyncio.create_task(self.q.dispatch_one(None))
+  try:
+   for _ in range(100):
+    if entered.is_set():break
+    await asyncio.sleep(.001)
+   self.assertTrue(entered.is_set())
+   self.assertFalse(task.done())
+  finally:release.set()
+  self.assertFalse(await task)

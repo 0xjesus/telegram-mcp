@@ -97,7 +97,7 @@ class Queue:
     def finish(self,ident,status,error=None,message_id=None,next_attempt=None):
         with self.db() as db:
             db.execute('UPDATE scheduled_messages SET status=?,error=?,message_id=?,next_attempt=COALESCE(?,next_attempt),updated_at=? WHERE id=?',(status,error,message_id,next_attempt,self.clock(),ident))
-    async def dispatch_one(self,send):
+    def claim(self):
         now=self.clock()
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -109,17 +109,27 @@ class Queue:
             if row['attempts']>=5:
                 db.execute("UPDATE scheduled_messages SET status='failed',error='attempt_limit' WHERE id=?",(row['id'],));return True
             db.execute("UPDATE scheduled_messages SET status='claimed',updated_at=? WHERE id=?",(now,row['id']))
-            row=dict(row)
+            return dict(row)
+
+    def current_status(self,ident):
+        with self.db() as db:return db.execute('SELECT status FROM scheduled_messages WHERE id=?',(ident,)).fetchone()[0]
+
+    def defer(self,ident,retry):
+        with self.db() as db:
+            db.execute("INSERT INTO scheduler_meta VALUES('cooldown_until',?) ON CONFLICT(key) DO UPDATE SET value=MAX(value,excluded.value)",(retry,))
+        self.finish(ident,'pending',error='rate_deferred',next_attempt=retry)
+
+    async def dispatch_one(self,send):
+        # Disk pressure must not block the MCP event loop while polling an empty queue.
+        row=await asyncio.to_thread(self.claim)
+        if not isinstance(row,dict):return bool(row)
         try:
             result=await asyncio.wait_for(send(row,lambda:self.mark_dispatching(row['id'])),timeout=max(.01,min(60,row['expires_at']-self.clock())))
-            self.finish(row['id'],'sent',message_id=result['message_id'])
+            await asyncio.to_thread(self.finish,row['id'],'sent',message_id=result['message_id'])
         except RetryLater as error:
             retry=self.clock()+max(5,error.seconds)
-            with self.db() as db:
-                db.execute("INSERT INTO scheduler_meta VALUES('cooldown_until',?) ON CONFLICT(key) DO UPDATE SET value=MAX(value,excluded.value)",(retry,))
-            self.finish(row['id'],'pending',error='rate_deferred',next_attempt=retry)
+            await asyncio.to_thread(self.defer,row['id'],retry)
         except Exception as error:
-            with self.db() as db:
-                current=db.execute('SELECT status FROM scheduled_messages WHERE id=?',(row['id'],)).fetchone()[0]
-            self.finish(row['id'],'uncertain' if current=='dispatching' else 'failed',error=type(error).__name__)
+            current=await asyncio.to_thread(self.current_status,row['id'])
+            await asyncio.to_thread(self.finish,row['id'],'uncertain' if current=='dispatching' else 'failed',error=type(error).__name__)
         return True

@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS group_monitoring_audit(
  evidence TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS group_monitoring_policy(singleton INTEGER PRIMARY KEY CHECK(singleton=1),enabled INTEGER NOT NULL DEFAULT 0,max_members INTEGER NOT NULL DEFAULT 10);
 CREATE TABLE IF NOT EXISTS group_monitoring_inventory(chat_id INTEGER PRIMARY KEY,name TEXT NOT NULL,member_count INTEGER,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS group_metadata_attempts(chat_id INTEGER PRIMARY KEY,attempted_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS group_policy_audit(seq INTEGER PRIMARY KEY,enabled INTEGER,max_members INTEGER,evidence TEXT,updated_at TEXT);'''
 
 
@@ -105,15 +106,20 @@ def configure_policy(db, enabled, max_members=10, evidence=''):
         db.execute("UPDATE group_monitoring_consent SET allowed=0 WHERE evidence LIKE 'auto:max-members:%'")
 
 
-def refresh_group(db, chat_id, name, member_count):
-    now=datetime.datetime.now(datetime.timezone.utc).isoformat()
+def refresh_group(db, chat_id, name, member_count, verified_at=None, attempted_at=None):
+    now=verified_at or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if attempted_at is not None:
+        db.execute('INSERT INTO group_metadata_attempts VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET attempted_at=excluded.attempted_at',(chat_id,attempted_at))
     valid_count=member_count if type(member_count) is int and member_count>0 else None
     db.execute('INSERT INTO group_monitoring_inventory VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET name=excluded.name,member_count=excluded.member_count,updated_at=excluded.updated_at',(int(chat_id),name,valid_count,now))
     config=db.execute('SELECT enabled,max_members FROM group_monitoring_policy WHERE singleton=1').fetchone()
     if not config or not config[0]: return
     existing=db.execute('SELECT allowed,evidence FROM group_monitoring_consent WHERE chat_id=?',(chat_id,)).fetchone()
     if existing and not existing[1].startswith(AUTO_PREFIX):return
-    permit=valid_count is not None and valid_count<=config[1]
+    try:
+        fresh=datetime.datetime.fromisoformat(now.replace('Z','+00:00')).timestamp()>datetime.datetime.now(datetime.timezone.utc).timestamp()-900
+    except (ValueError,TypeError):fresh=False
+    permit=valid_count is not None and valid_count<=config[1] and fresh
     db.execute('INSERT INTO group_monitoring_consent VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET allowed=excluded.allowed,evidence=excluded.evidence,updated_at=excluded.updated_at',(chat_id,int(permit),AUTO_PREFIX+str(config[1]),now))
     if permit and (not existing or not existing[0]):
         if db.execute("SELECT 1 FROM sqlite_master WHERE name='chat_sync'").fetchone():
@@ -129,7 +135,20 @@ def finish_inventory(db, seen):
             db.execute('UPDATE group_monitoring_inventory SET member_count=NULL WHERE chat_id=?',(row[0],))
 
 
+def metadata_plan(db, chat_id, now):
+    config=db.execute('SELECT enabled,max_members FROM group_monitoring_policy WHERE singleton=1').fetchone()
+    override=db.execute('SELECT evidence FROM group_monitoring_consent WHERE chat_id=?',(chat_id,)).fetchone()
+    inventory=db.execute('SELECT member_count,updated_at FROM group_monitoring_inventory WHERE chat_id=?',(chat_id,)).fetchone()
+    attempt=db.execute('SELECT attempted_at FROM group_metadata_attempts WHERE chat_id=?',(chat_id,)).fetchone()
+    count,verified_at=inventory if inventory else (None,None)
+    automatic=bool(config and config[0] and (not override or override[0].startswith(AUTO_PREFIX)))
+    interval=300 if config and count is not None and 0<count<=config[1] else 3600
+    return {'fetch':automatic and (not attempt or now-attempt[0]>=interval),'count':count,'verified_at':verified_at}
+
+
 def invalidate_group(db, chat_id):
+    db.execute('UPDATE group_monitoring_inventory SET member_count=NULL WHERE chat_id=?',(chat_id,))
+    db.execute('DELETE FROM group_metadata_attempts WHERE chat_id=?',(chat_id,))
     db.execute("UPDATE group_monitoring_consent SET allowed=0 WHERE chat_id=? AND evidence LIKE 'auto:max-members:%'",(chat_id,))
 
 if __name__=='__main__':main()

@@ -37,3 +37,27 @@ class PolicyTests(unittest.TestCase):
   consent.refresh_group(self.db,-1,'Small',3)
   consent.configure_policy(self.db,False,10,'disabled')
   self.assertFalse(consent.allowed(self.db,-1))
+ def test_metadata_cadence_and_policy_off(self):
+  consent.refresh_group(self.db,-2,'Small',3,verified_at='2000-01-01T00:00:00Z',attempted_at=1000)
+  self.assertFalse(consent.metadata_plan(self.db,-2,1299)['fetch'])
+  self.assertTrue(consent.metadata_plan(self.db,-2,1300)['fetch'])
+  consent.refresh_group(self.db,-2,'Large',11,attempted_at=1000)
+  self.assertFalse(consent.metadata_plan(self.db,-2,1300)['fetch'])
+  self.assertTrue(consent.metadata_plan(self.db,-2,4600)['fetch'])
+  consent.refresh_group(self.db,-2,'Unknown',None,attempted_at=5000)
+  self.assertFalse(consent.metadata_plan(self.db,-2,5300)['fetch'])
+  consent.configure_policy(self.db,False,10,'off')
+  self.assertFalse(consent.metadata_plan(self.db,-2,10000)['fetch'])
+ def test_cached_timestamp_expires_and_membership_invalidates(self):
+  old='2000-01-01T00:00:00Z'
+  consent.refresh_group(self.db,-2,'Small',3,verified_at=old,attempted_at=1000)
+  plan=consent.metadata_plan(self.db,-2,1100)
+  consent.refresh_group(self.db,-2,'Cached',plan['count'],verified_at=plan['verified_at'])
+  self.assertFalse(consent.allowed(self.db,-2))
+  self.assertEqual(self.db.execute('SELECT updated_at FROM group_monitoring_inventory WHERE chat_id=-2').fetchone()[0],old)
+  consent.invalidate_group(self.db,-2)
+  plan=consent.metadata_plan(self.db,-2,1100)
+  self.assertTrue(plan['fetch']);self.assertIsNone(plan['count'])
+ def test_manual_override_skips_rpc(self):
+  consent.set_consent(self.db,-2,False,'manual off')
+  self.assertFalse(consent.metadata_plan(self.db,-2,10000)['fetch'])

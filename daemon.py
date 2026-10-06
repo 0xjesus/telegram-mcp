@@ -13,7 +13,7 @@ import asyncio, json, logging, os, sqlite3, sys, time, datetime as dt, html, re,
 from pathlib import Path
 from memory_proxy import register_memory_tools
 from consent import allowed as monitoring_allowed, install as install_monitoring, predicate as monitoring_predicate
-from consent import refresh_group, finish_inventory, invalidate_group
+from consent import refresh_group, finish_inventory, invalidate_group, metadata_plan
 
 from aiohttp import web
 from telethon import TelegramClient, events, utils, functions, types
@@ -182,7 +182,8 @@ async def dispatch_scheduled(row,mark):
         raise RetryLater(error.seconds+1,'platform cooldown') from error
 
 async def scheduled_loop():
-    queue=scheduled_queue();queue.recover()
+    queue=await asyncio.to_thread(scheduled_queue)
+    await asyncio.to_thread(queue.recover)
     while True:
         try:await queue.dispatch_one(dispatch_scheduled)
         except Exception as error:log.warning('scheduled dispatcher: %s',type(error).__name__)
@@ -270,7 +271,7 @@ def monitoring_permitted(chat_id):
 
 def require_monitoring(chat_id):
     if not monitoring_permitted(chat_id):
-        raise RuntimeError("monitoring_not_authorized: el grupo requiere aprobación explícita")
+        raise RuntimeError("monitoring_not_authorized: monitoreo desactivado para este grupo")
 
 async def maybe_download_voice(chat_id, m):
     """Descarga notas de voz recientes para transcripción."""
@@ -389,7 +390,7 @@ def write_dialog_page(dialogs,expected_epoch=None):
                     c.execute("INSERT INTO users(id,name,username,phone,is_contact) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, username=excluded.username, phone=COALESCE(excluded.phone, phone), is_contact=excluded.is_contact",
                               (ent.id, utils.get_display_name(ent), ent.username, ent.phone, 1 if ent.contact else 0))
                 if chat_type(ent) in ('group','supergroup') and (expected_epoch is None or expected_epoch==S.monitoring_epoch):
-                    refresh_group(c,d.id,d.name or '',getattr(d,'monitoring_count',getattr(ent,'participants_count',None)))
+                    refresh_group(c,d.id,d.name or '',getattr(d,'monitoring_count',getattr(ent,'participants_count',None)),verified_at=getattr(d,'monitoring_verified_at',None),attempted_at=getattr(d,'monitoring_attempted_at',None))
                 # A dialog's newest message is a preview, not proof that the gap was fetched.
                 ensure_chat_sync(c, d.id)
                 head = getattr(getattr(d, "message", None), "id", None)
@@ -398,34 +399,76 @@ def write_dialog_page(dialogs,expected_epoch=None):
         c.close()
 
 
+def group_metadata_snapshot():
+    c=db()
+    try:
+        now=time.time()
+        ids=c.execute('SELECT chat_id FROM group_monitoring_inventory UNION SELECT chat_id FROM group_monitoring_consent').fetchall()
+        return ({row[0]:metadata_plan(c,row[0],now) for row in ids},metadata_plan(c,0,now))
+    finally:c.close()
+
+
+def write_group_metadata(dialogs,expected_epoch):
+    c=db()
+    try:
+        with c:
+            # Begin the write transaction before checking the membership epoch.
+            c.execute('UPDATE group_monitoring_policy SET enabled=enabled WHERE singleton=1')
+            if expected_epoch!=S.monitoring_epoch:return
+            for d in dialogs:
+                refresh_group(c,d.id,d.name or '',d.monitoring_count,
+                              verified_at=d.monitoring_verified_at,
+                              attempted_at=d.monitoring_attempted_at)
+    finally:c.close()
+
+
 async def upsert_dialogs():
     n = 0
     async with S.sync_lock:
         await sync_guard()
         dialogs = []
+        metadata = []
         seen_groups = []
         expected_epoch=S.monitoring_epoch
+        plans,default_plan=await asyncio.to_thread(group_metadata_snapshot)
         try:
             async for d in S.client.iter_dialogs():
                 if chat_type(d.entity) in ('group','supergroup'):
                     seen_groups.append(d.id)
+                    plan=plans.get(d.id,default_plan)
                     d.monitoring_count=getattr(d.entity,'participants_count',None)
-                    if d.monitoring_count is None and chat_type(d.entity)=='supergroup':
+                    d.monitoring_verified_at=iso(dt.datetime.now(dt.timezone.utc))
+                    d.monitoring_attempted_at=None
+                    if d.monitoring_count is not None:
+                        d.monitoring_attempted_at=time.time()
+                    elif chat_type(d.entity)=='supergroup' and plan['fetch']:
                         await sync_guard()
+                        d.monitoring_attempted_at=time.time()
                         try:
                             full=await S.client(functions.channels.GetFullChannelRequest(d.entity))
                             d.monitoring_count=getattr(full.full_chat,'participants_count',None)
+                            d.monitoring_verified_at=iso(dt.datetime.now(dt.timezone.utc))
                         except FloodWaitError:
+                            metadata.append(d)
                             raise
                         except Exception:
                             d.monitoring_count=None
                         await asyncio.sleep(max(0,PAUSE))
+                    else:
+                        d.monitoring_count=plan['count']
+                        d.monitoring_verified_at=plan['verified_at'] or '1970-01-01T00:00:00Z'
+                    metadata.append(d)
+                    if len(metadata)>=20:
+                        await asyncio.to_thread(write_group_metadata,metadata,expected_epoch)
+                        metadata=[]
                 dialogs.append(d)
                 n += 1
                 if len(dialogs) >= BATCH:
                     await asyncio.to_thread(write_dialog_page, dialogs, expected_epoch)
                     dialogs = []
                     await asyncio.sleep(max(0, PAUSE))
+            if metadata:
+                await asyncio.to_thread(write_group_metadata,metadata,expected_epoch)
             if dialogs:
                 await asyncio.to_thread(write_dialog_page, dialogs, expected_epoch)
             def finish():
@@ -435,6 +478,8 @@ async def upsert_dialogs():
                 finally:c.close()
             await asyncio.to_thread(finish)
         except FloodWaitError as e:
+            if metadata:
+                await asyncio.to_thread(write_group_metadata,metadata,expected_epoch)
             set_flood(e.seconds, "dialogs")
             await asyncio.to_thread(record_sync_error, None, e)
             raise SyncDeferred(f"FloodWait {e.seconds}s") from e
