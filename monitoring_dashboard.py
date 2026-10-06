@@ -13,6 +13,7 @@ import time
 from urllib.parse import urlparse
 import urllib.request
 from aiohttp import web
+from runtime_monitor import RuntimeMonitor, add_runtime_panel
 
 PLATFORMS={'whatsapp':'chat_jid','telegram':'chat_id'}
 REQUEST_INTERVAL=30
@@ -57,6 +58,12 @@ class Dashboard:
         for platform,col in PLATFORMS.items():
             c=self.connect(platform)
             try:
+                if platform=='telegram':
+                    tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    sync={str(r['chat_id']):dict(r) for r in c.execute('SELECT * FROM chat_sync')} if 'chat_sync' in tables else {}
+                    rescans={str(r[0]) for r in c.execute('SELECT chat_id FROM memory_group_rescan')} if 'memory_group_rescan' in tables else None
+                    retry=c.execute("SELECT CAST(value AS REAL) FROM sync_meta WHERE key='read_retry_after'").fetchone() if 'sync_meta' in tables else None
+                    retry_after=retry[0] if retry else 0
                 rows=c.execute(f'''SELECT i.{col} id,i.name,i.member_count,c.allowed,c.evidence,c.updated_at
                 FROM group_monitoring_inventory i LEFT JOIN group_monitoring_consent c ON c.{col}=i.{col} ORDER BY i.name''').fetchall()
                 for r in rows:
@@ -65,9 +72,34 @@ class Dashboard:
                         try:valid=dt.datetime.fromisoformat(r['updated_at'].replace('Z','+00:00')).timestamp()>time.time()-900
                         except (ValueError,TypeError,AttributeError):valid=False
                     job=recovery.get((platform,str(r['id'])),{})
-                    result.append(dict(platform=platform,id=str(r['id']),name=r['name'] or str(r['id']),members=r['member_count'],enabled=bool(r['allowed'] and valid),recovery=job.get('status','none'),recovery_error=job.get('error')))
+                    item=dict(platform=platform,id=str(r['id']),name=r['name'] or str(r['id']),members=r['member_count'],enabled=bool(r['allowed'] and valid),recovery=job.get('status','none'),recovery_error=job.get('error'))
+                    if platform=='telegram':
+                        item.update(self._telegram_recovery(sync.get(str(r['id'])),str(r['id']) in rescans if rescans is not None else None,item['enabled'],retry_after))
+                    result.append(item)
             finally:c.close()
         return result
+
+    @staticmethod
+    def _telegram_recovery(state,rescan,enabled,retry_after=0):
+        # These small durable tables describe source copying and local replay only.
+        # Neither a finished source cursor nor an empty replay queue proves that
+        # embeddings, attachment analysis or audio transcripts are complete.
+        state=state or {}
+        recent_pending=bool(state.get('incremental_pending')) or (state.get('dialog_head_id') or 0)>max(state.get('incremental_id') or 0,state.get('incremental_checked_head_id') or 0)
+        if not state:upstream='state_unknown'
+        elif max(state.get('retry_after') or 0,retry_after or 0)>time.time():upstream='retry_wait'
+        elif state.get('last_error'):upstream='sync_error'
+        elif recent_pending:upstream='recent_pending'
+        elif state.get('backfill_status')=='capped':upstream='history_limited'
+        elif state.get('backfill_status')!='done':upstream='history_pending'
+        else:upstream='history_ready'
+        recovery='source_'+upstream
+        if not enabled:recovery='paused'
+        elif upstream=='history_ready' and rescan:recovery='index_rescan_pending'
+        return dict(recovery=recovery,recovery_error='source_sync_error' if enabled and state.get('last_error') else None,
+                    sync=dict(upstream=upstream,history_status=state.get('backfill_status'),
+                              recent_pending=recent_pending,index_rescan_pending=rescan,
+                              source_updated_at=state.get('updated_at'),full_content_verified=False))
 
     def toggle(self,platform,ident,enabled,initial=False):
         if type(enabled)is not bool:raise ValueError('invalid_enabled')
@@ -77,16 +109,17 @@ class Dashboard:
         c=self.connect(platform)
         try:
             with c:
+                c.execute('BEGIN IMMEDIATE')
                 if not c.execute(f'SELECT 1 FROM group_monitoring_inventory WHERE {col}=?',(key,)).fetchone():raise ValueError('unknown_group')
-                before=c.execute(f'SELECT allowed FROM group_monitoring_consent WHERE {col}=?',(key,)).fetchone()
+                needs_recovery=enabled and not self._enabled(c,col,key)
                 evidence='dashboard:enable-all-explicit-user-request' if initial else 'dashboard:manual-toggle'
                 now=dt.datetime.now(dt.timezone.utc).isoformat()
                 c.execute(f'''INSERT INTO group_monitoring_consent({col},allowed,evidence,updated_at) VALUES(?,?,?,?)
                 ON CONFLICT({col}) DO UPDATE SET allowed=excluded.allowed,evidence=excluded.evidence,updated_at=excluded.updated_at''',(key,int(enabled),evidence,now))
                 c.execute(f'INSERT INTO group_monitoring_audit({col},allowed,evidence,updated_at) VALUES(?,?,?,?)',(key,int(enabled),evidence,now))
-                if enabled and (initial or not before or not before['allowed']):self._recover(c,platform,key)
+                if needs_recovery:self._recover(c,platform,key)
             with self.state_db() as jobs:
-                if enabled and (initial or not before or not before['allowed']):jobs.execute("INSERT INTO recovery(platform,chat_id,status) VALUES(?,?,'queued') ON CONFLICT(platform,chat_id) DO UPDATE SET status='queued',attempts=0,retry_at=0,error=NULL,anchor=NULL,watermark=0,scan_cursor=0,candidate_anchor=NULL,request_token=lower(hex(randomblob(16))),pages=0",(platform,ident))
+                if needs_recovery:jobs.execute("INSERT INTO recovery(platform,chat_id,status) VALUES(?,?,'queued') ON CONFLICT(platform,chat_id) DO UPDATE SET status='queued',attempts=0,retry_at=0,error=NULL,anchor=NULL,watermark=0,scan_cursor=0,candidate_anchor=NULL,request_token=lower(hex(randomblob(16))),pages=0",(platform,ident))
                 if not enabled:jobs.execute("UPDATE recovery SET status='paused' WHERE platform=? AND chat_id=?",(platform,ident))
         finally:c.close()
 
@@ -121,16 +154,21 @@ class Dashboard:
             if not keys:continue
             c=self.connect(platform)
             try:
+                recover_keys=[]
                 with c:
+                    c.execute('BEGIN IMMEDIATE')
                     now=dt.datetime.now(dt.timezone.utc).isoformat()
                     for ident in keys:
                         key=int(ident) if platform=='telegram' else ident
+                        needs_recovery=not self._enabled(c,col,key)
                         evidence='dashboard:enable-all-explicit-user-request'
                         c.execute(f'INSERT INTO group_monitoring_consent({col},allowed,evidence,updated_at) VALUES(?,1,?,?) ON CONFLICT({col}) DO UPDATE SET allowed=1,evidence=excluded.evidence,updated_at=excluded.updated_at',(key,evidence,now))
                         c.execute(f'INSERT INTO group_monitoring_audit({col},allowed,evidence,updated_at) VALUES(?,1,?,?)',(key,evidence,now))
-                        self._recover(c,platform,key)
+                        if needs_recovery:
+                            self._recover(c,platform,key)
+                            recover_keys.append(ident)
                 with self.state_db() as jobs:
-                    jobs.executemany("INSERT INTO recovery(platform,chat_id,status) VALUES(?,?,'queued') ON CONFLICT(platform,chat_id) DO UPDATE SET status='queued',attempts=0,retry_at=0,error=NULL,anchor=NULL,watermark=0,scan_cursor=0,candidate_anchor=NULL,request_token=lower(hex(randomblob(16))),pages=0",[(platform,k) for k in keys])
+                    jobs.executemany("INSERT INTO recovery(platform,chat_id,status) VALUES(?,?,'queued') ON CONFLICT(platform,chat_id) DO UPDATE SET status='queued',attempts=0,retry_at=0,error=NULL,anchor=NULL,watermark=0,scan_cursor=0,candidate_anchor=NULL,request_token=lower(hex(randomblob(16))),pages=0",[(platform,k) for k in recover_keys])
             finally:c.close()
 
     def recovery_status(self):
@@ -288,7 +326,7 @@ def mcp(name,args):
     return rpc('tools/call',{'name':name,'arguments':args})
 
 
-def application(dashboard,run_background=True):
+def application(dashboard,run_background=True,runtime_monitor=None):
     token=secrets.token_urlsafe(32)
     lock=asyncio.Lock()
     @web.middleware
@@ -303,7 +341,9 @@ def application(dashboard,run_background=True):
         response.headers.update({'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Content-Security-Policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; connect-src 'self'"})
         return response
     app=web.Application(middlewares=[private],client_max_size=4096)
-    async def page(request):return web.Response(text=Path(__file__).with_name('monitoring_dashboard.html').read_text().replace('__CSRF__',token),content_type='text/html')
+    observer=runtime_monitor if runtime_monitor is not None else RuntimeMonitor()
+    async def page(request):return web.Response(text=add_runtime_panel(Path(__file__).with_name('monitoring_dashboard.html').read_text().replace('__CSRF__',token)),content_type='text/html')
+    async def runtime(request):return web.json_response(observer.snapshot(),headers={'Cache-Control':'no-store'})
     async def inventory(request):
         rows=await asyncio.to_thread(dashboard.inventory)
         return web.json_response({'groups':rows,'default_enabled':True})
@@ -332,8 +372,11 @@ def application(dashboard,run_background=True):
         task.cancel()
         try:await task
         except asyncio.CancelledError:pass
-    if run_background:app.cleanup_ctx.append(background)
+    if run_background:
+        app.cleanup_ctx.append(background)
+        app.cleanup_ctx.append(observer.background)
     app.router.add_get('/',page);app.router.add_get('/api/groups',inventory)
+    app.router.add_get('/api/runtime',runtime)
     app.router.add_post('/api/toggle',toggle);app.router.add_post('/api/recover',recover)
     return app
 
