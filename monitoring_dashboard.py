@@ -13,6 +13,7 @@ import time
 from urllib.parse import urlparse
 import urllib.request
 from aiohttp import web
+from runtime_monitor import RuntimeMonitor, add_runtime_panel
 
 PLATFORMS={'whatsapp':'chat_jid','telegram':'chat_id'}
 REQUEST_INTERVAL=30
@@ -288,7 +289,7 @@ def mcp(name,args):
     return rpc('tools/call',{'name':name,'arguments':args})
 
 
-def application(dashboard,run_background=True):
+def application(dashboard,run_background=True,runtime_monitor=None):
     token=secrets.token_urlsafe(32)
     lock=asyncio.Lock()
     @web.middleware
@@ -303,7 +304,9 @@ def application(dashboard,run_background=True):
         response.headers.update({'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Content-Security-Policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; connect-src 'self'"})
         return response
     app=web.Application(middlewares=[private],client_max_size=4096)
-    async def page(request):return web.Response(text=Path(__file__).with_name('monitoring_dashboard.html').read_text().replace('__CSRF__',token),content_type='text/html')
+    observer=runtime_monitor if runtime_monitor is not None else RuntimeMonitor()
+    async def page(request):return web.Response(text=add_runtime_panel(Path(__file__).with_name('monitoring_dashboard.html').read_text().replace('__CSRF__',token)),content_type='text/html')
+    async def runtime(request):return web.json_response(observer.snapshot(),headers={'Cache-Control':'no-store'})
     async def inventory(request):
         rows=await asyncio.to_thread(dashboard.inventory)
         return web.json_response({'groups':rows,'default_enabled':True})
@@ -332,8 +335,11 @@ def application(dashboard,run_background=True):
         task.cancel()
         try:await task
         except asyncio.CancelledError:pass
-    if run_background:app.cleanup_ctx.append(background)
+    if run_background:
+        app.cleanup_ctx.append(background)
+        app.cleanup_ctx.append(observer.background)
     app.router.add_get('/',page);app.router.add_get('/api/groups',inventory)
+    app.router.add_get('/api/runtime',runtime)
     app.router.add_post('/api/toggle',toggle);app.router.add_post('/api/recover',recover)
     return app
 
