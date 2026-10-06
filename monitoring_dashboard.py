@@ -109,16 +109,17 @@ class Dashboard:
         c=self.connect(platform)
         try:
             with c:
+                c.execute('BEGIN IMMEDIATE')
                 if not c.execute(f'SELECT 1 FROM group_monitoring_inventory WHERE {col}=?',(key,)).fetchone():raise ValueError('unknown_group')
-                before=c.execute(f'SELECT allowed FROM group_monitoring_consent WHERE {col}=?',(key,)).fetchone()
+                needs_recovery=enabled and not self._enabled(c,col,key)
                 evidence='dashboard:enable-all-explicit-user-request' if initial else 'dashboard:manual-toggle'
                 now=dt.datetime.now(dt.timezone.utc).isoformat()
                 c.execute(f'''INSERT INTO group_monitoring_consent({col},allowed,evidence,updated_at) VALUES(?,?,?,?)
                 ON CONFLICT({col}) DO UPDATE SET allowed=excluded.allowed,evidence=excluded.evidence,updated_at=excluded.updated_at''',(key,int(enabled),evidence,now))
                 c.execute(f'INSERT INTO group_monitoring_audit({col},allowed,evidence,updated_at) VALUES(?,?,?,?)',(key,int(enabled),evidence,now))
-                if enabled and (initial or not before or not before['allowed']):self._recover(c,platform,key)
+                if needs_recovery:self._recover(c,platform,key)
             with self.state_db() as jobs:
-                if enabled and (initial or not before or not before['allowed']):jobs.execute("INSERT INTO recovery(platform,chat_id,status) VALUES(?,?,'queued') ON CONFLICT(platform,chat_id) DO UPDATE SET status='queued',attempts=0,retry_at=0,error=NULL,anchor=NULL,watermark=0,scan_cursor=0,candidate_anchor=NULL,request_token=lower(hex(randomblob(16))),pages=0",(platform,ident))
+                if needs_recovery:jobs.execute("INSERT INTO recovery(platform,chat_id,status) VALUES(?,?,'queued') ON CONFLICT(platform,chat_id) DO UPDATE SET status='queued',attempts=0,retry_at=0,error=NULL,anchor=NULL,watermark=0,scan_cursor=0,candidate_anchor=NULL,request_token=lower(hex(randomblob(16))),pages=0",(platform,ident))
                 if not enabled:jobs.execute("UPDATE recovery SET status='paused' WHERE platform=? AND chat_id=?",(platform,ident))
         finally:c.close()
 
@@ -153,16 +154,21 @@ class Dashboard:
             if not keys:continue
             c=self.connect(platform)
             try:
+                recover_keys=[]
                 with c:
+                    c.execute('BEGIN IMMEDIATE')
                     now=dt.datetime.now(dt.timezone.utc).isoformat()
                     for ident in keys:
                         key=int(ident) if platform=='telegram' else ident
+                        needs_recovery=not self._enabled(c,col,key)
                         evidence='dashboard:enable-all-explicit-user-request'
                         c.execute(f'INSERT INTO group_monitoring_consent({col},allowed,evidence,updated_at) VALUES(?,1,?,?) ON CONFLICT({col}) DO UPDATE SET allowed=1,evidence=excluded.evidence,updated_at=excluded.updated_at',(key,evidence,now))
                         c.execute(f'INSERT INTO group_monitoring_audit({col},allowed,evidence,updated_at) VALUES(?,1,?,?)',(key,evidence,now))
-                        self._recover(c,platform,key)
+                        if needs_recovery:
+                            self._recover(c,platform,key)
+                            recover_keys.append(ident)
                 with self.state_db() as jobs:
-                    jobs.executemany("INSERT INTO recovery(platform,chat_id,status) VALUES(?,?,'queued') ON CONFLICT(platform,chat_id) DO UPDATE SET status='queued',attempts=0,retry_at=0,error=NULL,anchor=NULL,watermark=0,scan_cursor=0,candidate_anchor=NULL,request_token=lower(hex(randomblob(16))),pages=0",[(platform,k) for k in keys])
+                    jobs.executemany("INSERT INTO recovery(platform,chat_id,status) VALUES(?,?,'queued') ON CONFLICT(platform,chat_id) DO UPDATE SET status='queued',attempts=0,retry_at=0,error=NULL,anchor=NULL,watermark=0,scan_cursor=0,candidate_anchor=NULL,request_token=lower(hex(randomblob(16))),pages=0",[(platform,k) for k in recover_keys])
             finally:c.close()
 
     def recovery_status(self):
