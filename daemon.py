@@ -105,6 +105,7 @@ class State:
         self.send_lock = asyncio.Lock()
         self.scheduler_task = None
         self.monitoring_epoch = 0
+        self.monitoring_epochs = {}
 
 S = State()
 
@@ -376,6 +377,12 @@ def record_sync_error(chat_id, error, incremental=False):
         c.close()
 
 
+def metadata_current(dialog, fallback_epoch=None):
+    if hasattr(dialog,'monitoring_epoch'):
+        return dialog.monitoring_epoch==S.monitoring_epochs.get(dialog.id,0)
+    return fallback_epoch is None or fallback_epoch==S.monitoring_epoch
+
+
 def write_dialog_page(dialogs,expected_epoch=None):
     c = db()
     try:
@@ -390,7 +397,7 @@ def write_dialog_page(dialogs,expected_epoch=None):
                 if isinstance(ent, types.User):
                     c.execute("INSERT INTO users(id,name,username,phone,is_contact) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, username=excluded.username, phone=COALESCE(excluded.phone, phone), is_contact=excluded.is_contact",
                               (ent.id, utils.get_display_name(ent), ent.username, ent.phone, 1 if ent.contact else 0))
-                if chat_type(ent) in ('group','supergroup') and (expected_epoch is None or expected_epoch==S.monitoring_epoch):
+                if chat_type(ent) in ('group','supergroup') and metadata_current(d,expected_epoch):
                     refresh_group(c,d.id,d.name or '',getattr(d,'monitoring_count',getattr(ent,'participants_count',None)),verified_at=getattr(d,'monitoring_verified_at',None),attempted_at=getattr(d,'monitoring_attempted_at',None))
                 # A dialog's newest message is a preview, not proof that the gap was fetched.
                 ensure_chat_sync(c, d.id)
@@ -415,8 +422,8 @@ def write_group_metadata(dialogs,expected_epoch):
         with c:
             # Begin the write transaction before checking the membership epoch.
             c.execute('UPDATE group_monitoring_policy SET enabled=enabled WHERE singleton=1')
-            if expected_epoch!=S.monitoring_epoch:return
             for d in dialogs:
+                if not metadata_current(d,expected_epoch):continue
                 refresh_group(c,d.id,d.name or '',d.monitoring_count,
                               verified_at=d.monitoring_verified_at,
                               attempted_at=d.monitoring_attempted_at)
@@ -436,6 +443,7 @@ async def upsert_dialogs():
             async for d in S.client.iter_dialogs():
                 if chat_type(d.entity) in ('group','supergroup'):
                     seen_groups.append(d.id)
+                    d.monitoring_epoch=S.monitoring_epochs.get(d.id,0)
                     plan=plans.get(d.id,default_plan)
                     d.monitoring_count=getattr(d.entity,'participants_count',None)
                     d.monitoring_verified_at=iso(dt.datetime.now(dt.timezone.utc))
@@ -657,6 +665,7 @@ def register_events():
     async def group_membership_changed(event):
         if event.chat_id and (event.user_added or event.user_joined or event.user_left or event.user_kicked):
             S.monitoring_epoch+=1
+            S.monitoring_epochs[event.chat_id]=S.monitoring_epochs.get(event.chat_id,0)+1
             c=db()
             try:
                 with c:invalidate_group(c,event.chat_id)

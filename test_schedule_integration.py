@@ -46,3 +46,14 @@ class ScheduleIntegrationTests(SyncHistoryTests):
   c=self.daemon.db()
   self.assertGreater(float(c.execute("SELECT value FROM sync_meta WHERE key='read_retry_after'").fetchone()[0]),0)
   c.close()
+
+ async def test_membership_change_does_not_invalidate_other_group_snapshot(self):
+  from consent import configure_policy,allowed
+  c=self.daemon.db();configure_policy(c,True,10,'synthetic authorization');c.close()
+  stamp=dt.datetime.now(dt.timezone.utc).isoformat()
+  dialogs=[SimpleNamespace(id=cid,name='Synthetic',monitoring_count=3,monitoring_verified_at=stamp,monitoring_attempted_at=None,monitoring_epoch=0) for cid in (-7,-8)]
+  self.daemon.S.monitoring_epoch=1
+  self.daemon.S.monitoring_epochs[-7]=1
+  self.daemon.write_group_metadata(dialogs,0)
+  c=self.daemon.db()
+  self.assertFalse(allowed(c,-7));self.assertTrue(allowed(c,-8));c.close()
