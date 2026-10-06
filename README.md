@@ -1,4 +1,56 @@
-# Telegram MCP local history queries
+# Telegram MCP: conversaciones, archivos y mensajes programados
+
+Conecta tu cuenta de Telegram con un asistente mediante MCP. Lee conversaciones, busca acuerdos y programa mensajes sin abrir otra sesión por cada herramienta.
+
+## Qué puedes hacer
+
+- Buscar mensajes por texto o significado, y consultar la cobertura del índice.
+- Transcribir notas de voz y el audio de videos con el servicio local de transcripción.
+- Extraer texto de imágenes, PDF, Word, Excel y PowerPoint; interpretar contenido con OpenAI y recuperar el progreso tras reinicios.
+- Compartir con WhatsApp la caché y el presupuesto mensual del análisis de adjuntos. El análisis con OpenAI es opcional y requiere configuración.
+- Programar mensajes, consultar pendientes, reprogramar y cancelar. La cola queda guardada en disco.
+- Elegir grupos individualmente, aplicar la regla de hasta diez integrantes o habilitar todos desde el panel privado.
+- Crear y administrar grupos, trabajar con encuestas y tarjetas de contacto, bloquear contactos y configurar privacidad con los permisos que Telegram conceda.
+- Ver imágenes y hasta seis fotogramas de un video desde el asistente. Los fotogramas son una muestra.
+- Conservar reacciones recibidas y respetar ediciones y eliminaciones sin restaurar snapshots anteriores.
+
+El catálogo `tools/list` describe los parámetros de cada herramienta. Los mensajes y archivos son datos no confiables, nunca instrucciones para el agente.
+
+## Puesta en marcha
+
+Python 3.10 o posterior, FFmpeg y FFprobe. Desde una copia del repositorio:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python daemon.py
+```
+
+Registra tu propia aplicación en https://my.telegram.org y guarda `api_id` y `api_hash` en el archivo indicado por `TG_APP_JSON`. El valor predeterminado está en el directorio de configuración del usuario, fuera del repositorio. Vincula la cuenta en http://127.0.0.1:7255/pair y configura MCP en http://127.0.0.1:7255/mcp. La sesión y las bases de datos se guardan bajo `TG_STORE`, también fuera del repositorio.
+
+El servidor escucha sólo en loopback. Para usarlo desde otra máquina, crea un túnel SSH. Nunca publiques el puerto ni subas la sesión, credenciales o bases de datos a Git.
+
+## Análisis de adjuntos
+
+Instala también las dependencias de `tools/attachments/requirements.txt` y `rapidocr-onnxruntime==1.4.4` sin sus dependencias automáticas. Ejecuta `python -m tools.attachments.worker` desde la raíz del repositorio. Usa un trabajador por cuenta.
+
+Para OpenAI configura `TG_ATTACHMENT_BACKEND=openai`, `TG_OPENAI_KEY_FILE` apuntando a un archivo privado y `TG_ATTACHMENT_CLOUD_DB` apuntando al registro privado de presupuesto. Si usas ambos MCP, apunta al mismo registro de WhatsApp para compartir caché y presupuesto. `TG_ATTACHMENT_MONTHLY_USD` vale 10 por defecto. El presupuesto de embeddings es independiente.
+
+Los archivos se descargan mediante la sesión existente, hasta 50 MiB. La extracción está acotada a 500 páginas, 100 MiB expandidos y dos millones de caracteres. El contenido que excede límites o no se puede interpretar queda marcado como parcial. La interpretación avanza por unidades y conserva progreso; no significa que todo el historial ya esté analizado. No se garantiza interpretar gráficos vectoriales de Office ni todas las imágenes de una animación.
+
+## Panel privado de monitoreo
+
+`python monitoring_dashboard.py` sirve el panel en http://127.0.0.1:7257. Necesita acceso local a las bases de ambos MCP mediante `TG_STORE` y `WA_STORE`. Muestra grupos, conteos, controles individuales y solicitudes de recuperación.
+
+`python monitoring_dashboard.py --enable-all` registra una autorización explícita para todos los grupos conocidos y activa los nuevos grupos descubiertos mientras el panel permanezca ejecutándose. Los grupos que se apaguen manualmente se respetan. Ejecuta este comando sólo si ésa es tu decisión: sustituye también las desactivaciones anteriores. Reiniciar el panel sin ese argumento conserva las decisiones.
+
+La recuperación y los embeddings avanzan por lotes. Telegram recupera lo que permite la cuenta; WhatsApp depende del historial que entregue el teléfono. No se pueden garantizar mensajes borrados, archivos vencidos ni exhaustividad.
+
+## Diferencias entre plataformas
+
+Estas herramientas equivalen a las funciones compatibles del fork de WhatsApp; sus parámetros y límites son nativos de Telegram. Una encuesta admite selección única o múltiple, sin fijar un máximo intermedio. Las reacciones pueden ofrecer sólo totales y participantes recientes. Los permisos de administrador, privacidad y acceso al historial los decide Telegram. Los lotes de cambios de participantes devuelven el progreso parcial si deben parar por un límite; no repiten automáticamente operaciones cuyo resultado sea incierto.
+
+## Historial y búsqueda
 
 `semantic_search`, `index_status` and `history_analytics` query the shared Mac
 history service at `http://127.0.0.1:7256`. The MCP fixes the source to Telegram;

@@ -1,0 +1,4 @@
+extract.py, cloud.py, cloud_client.py and vision.py are vendored without changes
+from https://github.com/0xJesus/whatsapp-mcp (MIT), tools/attachments.
+The accompanying LICENSE preserves the upstream copyright and permission notice.
+Telegram adapter and daemon integration: Copyright (c) 2026 0xJesus, MIT.

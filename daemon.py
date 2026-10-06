@@ -83,6 +83,10 @@ def init_db():
     CREATE TABLE IF NOT EXISTS sync_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """)
     install_monitoring(c)
+    from tools.attachments.worker import initialize as initialize_attachments
+    initialize_attachments(c)
+    from message_extras import install as install_message_extras
+    install_message_extras(c)
     initialize_sync_state(c)
     c.commit(); c.close()
 
@@ -227,6 +231,16 @@ def media_info(m):
     if isinstance(m.media, types.MessageMediaWebPage): return None, None
     return "media", None
 
+def media_identity(m):
+    """Stable Telegram media identity; access hashes/file references may rotate."""
+    for kind in ('document', 'photo'):
+        obj = getattr(m, kind, None)
+        ident = getattr(obj, 'id', None)
+        if ident is not None:
+            return f'{kind}:{ident}'
+    return ''
+
+
 def sender_name_of(m):
     s = m.sender
     if s is not None:
@@ -247,13 +261,23 @@ def msg_text(m):
         t = t or f"[{type(m.action).__name__.replace('MessageAction','')}]"
     return t
 
-def upsert_message(c, chat_id, m, keep_transcript=True):
-    if not monitoring_allowed(c, chat_id) or m is None or m.date is None:
+def upsert_message(c, chat_id, m, keep_transcript=True, snapshot_generation=None):
+    if m is None or m.date is None:
+        return None
+    if not c.in_transaction:c.execute('BEGIN IMMEDIATE')
+    from message_extras import is_deleted, capture_reactions, accept_content
+    if not monitoring_allowed(c, chat_id) or is_deleted(c, chat_id, m.id):
+        return None
+    identity = media_identity(m)
+    if not accept_content(c, chat_id, m, snapshot_generation, identity):
         return None
     mt, name = media_info(m)
     text = msg_text(m)
-    existing = c.execute("SELECT text, media_path FROM messages WHERE chat_id=? AND id=?", (chat_id, m.id)).fetchone()
-    if keep_transcript and not text and existing and existing["text"] and mt == "voice":
+    existing = c.execute("SELECT text, media_path, media_hash FROM messages WHERE chat_id=? AND id=?", (chat_id, m.id)).fetchone()
+    replaced = existing is not None and existing['media_hash'] != identity
+    if replaced:
+        c.execute('DELETE FROM transcripts WHERE chat_id=? AND id=?',(chat_id,m.id))
+    if keep_transcript and not replaced and not text and existing and existing["text"] and mt == "voice":
         text = existing["text"]
     c.execute("""INSERT INTO messages(chat_id,id,date,sender_id,sender_name,out,text,reply_to,media_type,media_name,media_path,edited)
                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
@@ -261,10 +285,21 @@ def upsert_message(c, chat_id, m, keep_transcript=True):
                  media_type=excluded.media_type, media_name=excluded.media_name, media_path=COALESCE(messages.media_path, excluded.media_path)""",
               (chat_id, m.id, iso(m.date), m.sender_id, sender_name_of(m), 1 if m.out else 0, text, m.reply_to_msg_id,
                mt, name, existing["media_path"] if existing else None, 1 if m.edit_date else 0))
+    c.execute("""UPDATE messages SET media_path=CASE WHEN media_hash IS NOT ? THEN NULL ELSE media_path END,
+        media_hash=?,media_size=? WHERE chat_id=? AND id=?""",
+        (identity, identity, getattr(getattr(m, 'file', None), 'size', None), chat_id, m.id))
     if m.sender is not None and isinstance(m.sender, types.User):
         c.execute("INSERT INTO users(id,name,username,phone,is_contact) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, username=COALESCE(excluded.username, username), phone=COALESCE(excluded.phone, phone)",
                   (m.sender.id, utils.get_display_name(m.sender), m.sender.username, m.sender.phone, 1 if m.sender.contact else 0))
+    capture_reactions(c, chat_id, m, snapshot_generation)
     return mt
+
+
+def message_snapshot_generation():
+    from message_extras import generation
+    c=db()
+    try:return generation(c)
+    finally:c.close()
 
 def monitoring_permitted(chat_id):
     c=db()
@@ -516,16 +551,17 @@ def read_sync_plan(chat_id, incremental, limit):
         c.close()
 
 
-def commit_sync_page(chat_id, messages, incremental, page_limit):
+def commit_sync_page(chat_id, messages, incremental, page_limit, snapshot_generation=None):
     c = db()
     voices = []
     try:
         with c:
+            c.execute('BEGIN IMMEDIATE')
             if not monitoring_allowed(c,chat_id):return []
             state = ensure_chat_sync(c, chat_id)
             first = c.execute("SELECT first_pass_done FROM chats WHERE id=?", (chat_id,)).fetchone()
             for m in messages:
-                if upsert_message(c, chat_id, m) == "voice":
+                if upsert_message(c, chat_id, m, snapshot_generation=snapshot_generation) == "voice":
                     voices.append(m)
             ids = [m.id for m in messages]
             now = iso(dt.datetime.now(dt.timezone.utc))
@@ -571,10 +607,11 @@ async def sync_chat(chat_id, limit, incremental=True):
             kwargs["offset_id"] = state["backfill_id"]
         messages = []
         try:
+            snapshot_generation=await asyncio.to_thread(message_snapshot_generation)
             entity = await S.client.get_input_entity(chat_id)
             async for m in S.client.iter_messages(entity, **kwargs):
                 messages.append(m)
-            voices = await asyncio.to_thread(commit_sync_page, chat_id, messages, incremental, limit)
+            voices = await asyncio.to_thread(commit_sync_page, chat_id, messages, incremental, limit, snapshot_generation)
         except Exception as e:
             if isinstance(e, FloodWaitError):
                 set_flood(e.seconds, f"sync {chat_id}")
@@ -684,12 +721,14 @@ def register_events():
 
     @cl.on(events.MessageDeleted())
     async def on_del(ev):
-        if ev.chat_id is None:
-            return
         c = db()
-        for mid in ev.deleted_ids:
-            c.execute("UPDATE messages SET deleted=1 WHERE chat_id=? AND id=?", (ev.chat_id, mid))
-        c.commit(); c.close()
+        from message_extras import record_deleted
+        try:
+            with c:record_deleted(c, ev.chat_id, ev.deleted_ids)
+        finally:c.close()
+
+    from message_extras import register_events as register_extra_events
+    register_extra_events(globals())
 
 async def after_login():
     S.me = await S.client.get_me()
@@ -961,24 +1000,129 @@ async def t_read(a):
 
 @tool("download_media", "Descarga el adjunto de un mensaje (foto, documento, audio, video) a ~/.local/share/telegram-mcp/media/ y devuelve la ruta.", {"type": "object", "properties": {"chat": {"type": "string"}, "message_id": {"type": "integer"}}, "required": ["chat", "message_id"]})
 async def t_download(a):
-    need_auth(); cid = await resolve(a["chat"]); mid = int(a["message_id"])
+    need_auth();cid=await resolve(a['chat']);mid=int(a['message_id'])
+    require_monitoring(cid);await sync_guard()
+    snapshot_generation=await asyncio.to_thread(message_snapshot_generation)
+    m=await S.client.get_messages(cid,ids=mid)
     require_monitoring(cid)
-    m = await S.client.get_messages(cid, ids=mid)
-    require_monitoring(cid)
-    if not m or not m.media: raise RuntimeError("el mensaje no tiene adjunto")
-    dest_dir = STORE / "media" / str(cid); dest_dir.mkdir(parents=True, exist_ok=True)
-    scratch=Path(tempfile.mkdtemp(prefix=f"{mid}_",dir=dest_dir))
+    c=db()
     try:
-        path = await S.client.download_media(m, file=str(scratch / "attachment"))
-        require_monitoring(cid)
-        c = db(); c.execute("UPDATE messages SET media_path=? WHERE chat_id=? AND id=?", (path, cid, mid)); c.commit(); c.close()
-        return {"path": path, "type": media_info(m)[0], "mime": getattr(m.file, "mime_type", None)}
+        with c:
+            if m:upsert_message(c,cid,m,snapshot_generation=snapshot_generation)
+            else:
+                from message_extras import record_deleted
+                record_deleted(c,cid,[mid])
+    finally:c.close()
+    if not m or not m.media:raise RuntimeError('message_has_no_attachment')
+    identity=media_identity(m)
+    if not identity:raise RuntimeError('unsupported_media_identity')
+    limit=50*1024*1024
+    if (getattr(getattr(m,'file',None),'size',0) or 0)>limit:raise RuntimeError('file_size_limit')
+    def validate():
+        from message_extras import is_deleted
+        c=db()
+        try:
+            if not monitoring_allowed(c,cid):raise RuntimeError('monitoring_not_authorized')
+            row=c.execute('SELECT media_hash FROM messages WHERE chat_id=? AND id=?',(cid,mid)).fetchone()
+            if not row or row[0]!=identity or is_deleted(c,cid,mid):raise RuntimeError('media_changed_or_deleted')
+        finally:c.close()
+    validate()
+    dest_dir=STORE/'media'/str(cid);dest_dir.mkdir(parents=True,exist_ok=True)
+    scratch=Path(tempfile.mkdtemp(prefix=f'{mid}_',dir=dest_dir))
+    try:
+        async def progress(current,total):
+            if current>limit or total and total>limit:raise RuntimeError('file_size_limit')
+            validate()
+        await sync_guard()
+        path=await asyncio.wait_for(S.client.download_media(m,file=str(scratch/'attachment'),progress_callback=progress),timeout=180)
+        validate()
+        path=Path(path).resolve()
+        if not path.is_relative_to(scratch.resolve()) or not path.is_file() or path.stat().st_size>limit:raise RuntimeError('file_size_limit')
+        c=db()
+        try:
+            with c:
+                c.execute('BEGIN IMMEDIATE');validate()
+                c.execute('UPDATE messages SET media_path=? WHERE chat_id=? AND id=? AND media_hash=?',(str(path),cid,mid,identity))
+        finally:c.close()
+        return {'path':str(path),'type':media_info(m)[0],'mime':getattr(m.file,'mime_type',None),'media_hash':identity}
     except BaseException as error:
         shutil.rmtree(scratch,ignore_errors=True)
         if isinstance(error,FloodWaitError):
-            set_flood(error.seconds,"download_media")
-            raise RuntimeError(f"FloodWait {error.seconds}s") from error
+            set_flood(error.seconds,'download_media');record_sync_error(None,error)
         raise
+
+@tool("download_attachment", "Descarga acotada para el trabajador de adjuntos, con validación de identidad y consentimiento.",
+      {"type":"object","properties":{"chat":{"type":"string"},"message_id":{"type":"integer"},
+       "expected_media_hash":{"type":"string"},"output_path":{"type":"string"}},
+       "required":["chat","message_id","expected_media_hash","output_path"]})
+async def t_download_attachment(a):
+    need_auth()
+    cid = await resolve(a['chat']); mid = int(a['message_id'])
+    expected = a['expected_media_hash']
+    root = (STORE / 'attachment-tmp').resolve()
+    dest = Path(a['output_path']).resolve()
+    if not dest.is_relative_to(root) or dest == root or dest.exists():
+        raise ValueError('invalid_attachment_output_path')
+    limit = 50 * 1024 * 1024
+
+    def validate(identity):
+        c = db()
+        try:
+            require_monitoring(cid)
+            row = c.execute('SELECT deleted,media_hash FROM messages WHERE chat_id=? AND id=?',(cid,mid)).fetchone()
+            if not row or row['deleted']: raise RuntimeError('message_unavailable')
+            if row['media_hash'] != identity: raise RuntimeError('media_changed')
+        finally: c.close()
+
+    validate(expected)
+    try:
+        await sync_guard()
+        snapshot_generation=await asyncio.to_thread(message_snapshot_generation)
+        m = await S.client.get_messages(cid, ids=mid)
+        validate(expected)
+        if not m:
+            from message_extras import record_deleted
+            c = db()
+            try:
+                with c:record_deleted(c,cid,[mid])
+            finally:c.close()
+            raise RuntimeError('message_unavailable')
+        identity = media_identity(m)
+        size = getattr(getattr(m,'file',None),'size',None)
+        media_type, filename = media_info(m)
+        # Resolve legacy identities and record live replacements before leaving the call.
+        c = db()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            if not monitoring_allowed(c,cid): raise RuntimeError('monitoring_not_authorized')
+            upsert_message(c,cid,m,snapshot_generation=snapshot_generation)
+            c.commit()
+        finally: c.close()
+        if expected and expected != identity: raise RuntimeError('media_changed')
+        if not identity: raise RuntimeError('unsupported_media_identity')
+        validate(identity)
+        if size is not None and size > limit: raise RuntimeError('file_size_limit')
+        await sync_guard()
+
+        async def transfer():
+            total = 0
+            with dest.open('xb') as output:
+                async for chunk in S.client.iter_download(m.media, request_size=256*1024):
+                    total += len(chunk)
+                    if total > limit: raise RuntimeError('file_size_limit')
+                    validate(identity)
+                    output.write(chunk)
+        await asyncio.wait_for(transfer(), timeout=180)
+        validate(identity)
+        return {'path':str(dest),'media_hash':identity,'size':dest.stat().st_size,
+                'mime':getattr(getattr(m,'file',None),'mime_type',None),
+                'media_type':media_type,'filename':filename}
+    except BaseException as error:
+        dest.unlink(missing_ok=True)
+        if isinstance(error,FloodWaitError):
+            set_flood(error.seconds,'download_attachment');record_sync_error(None,error)
+        raise
+
 
 @tool("get_chat_info", "Información de un chat/usuario/grupo: miembros (grupos pequeños), bio, username, teléfono si es contacto.", {"type": "object", "properties": {"chat": {"type": "string"}}, "required": ["chat"]})
 async def t_info(a):
@@ -1008,6 +1152,11 @@ async def t_sync(a):
     old = await sync_chat(cid, int(a.get("limit", 1000)), incremental=False); new = await sync_chat(cid, 500, incremental=True)
     c = db(); n = c.execute("SELECT COUNT(*) AS n FROM messages WHERE chat_id=?", (cid,)).fetchone()["n"]; c.close()
     return {"fetched_older": old, "fetched_newer": new, "total_in_db": n}
+
+from advanced_tools import register as register_advanced_tools
+register_advanced_tools(tool, globals())
+from media_preview import register as register_media_preview
+register_media_preview(tool, globals())
 
 async def mcp(request):
     if request.method == "GET":
@@ -1039,6 +1188,8 @@ async def mcp(request):
                                  "send_reaction", "mark_read", "download_media", "get_chat_info"}:
                     await sync_guard()
                 r = await t["fn"](params.get("arguments") or {})
+                if t['name']=='get_media_preview' and isinstance(r,dict) and '_mcp_content' in r:
+                    return ok({'content':r['_mcp_content'],'isError':False})
                 return ok({"content": [{"type": "text", "text": json.dumps(r, ensure_ascii=False, indent=2, default=str)}], "isError": False})
             except Exception as e:
                 flood = next((err for err in (e, e.__cause__, e.__context__) if isinstance(err, FloodWaitError)), None)

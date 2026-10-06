@@ -82,8 +82,11 @@ class GroupConsentTests(unittest.IsolatedAsyncioTestCase):
         from types import SimpleNamespace
         c=self.daemon.db();c.execute("INSERT INTO chats(id,type,title) VALUES(-7,'group','Synthetic group')");c.commit()
         set_consent(c,-7,True,'synthetic',True)
-        self.daemon.S.client.get_messages=AsyncMock(return_value=SimpleNamespace(media=object()))
-        async def download(m,file):
+        from telethon import types
+        m=message(1)
+        m.media=types.MessageMediaDocument(document=types.Document(id=44,access_hash=1,file_reference=b'',date=m.date,mime_type='text/plain',size=4,dc_id=1,attributes=[]))
+        self.daemon.S.client.get_messages=AsyncMock(return_value=m)
+        async def download(m,file,progress_callback):
             Path(file).write_bytes(b'synthetic private attachment')
             set_consent(c,-7,False,'revoked during transfer')
             return file

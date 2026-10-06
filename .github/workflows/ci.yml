@@ -1,0 +1,26 @@
+name: Tests and secret scan
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: python -m pip install -r requirements.txt -r tools/attachments/requirements.txt
+      - run: python -m pip install --no-deps rapidocr-onnxruntime==1.4.4
+      - run: python -m unittest discover -q
+      - run: python -m unittest tools.attachments.test_extract tools.attachments.test_cloud_client tools.attachments.test_cloud_retention tools.attachments.test_cloud_enrichment tools.attachments.test_raster_pdf -q
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
