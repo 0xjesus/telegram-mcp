@@ -88,7 +88,7 @@ def discover(db, limit=200):
     cursor=int(db.execute("SELECT value FROM attachment_meta WHERE key='discovery_cursor'").fetchone()[0])
     rows=db.execute('SELECT rowid,chat_id,id,media_type,deleted FROM messages WHERE rowid>? ORDER BY rowid LIMIT ?', (cursor,min(200,max(1,limit)))).fetchall()
     for row in rows:
-        if not row['deleted'] and row['media_type'] in ('photo','image','sticker','document'):
+        if not row['deleted'] and row['media_type'] in ('photo','image','document'):
             prior=db.execute('SELECT status,metadata,retry_at FROM attachment_analysis WHERE chat_id=? AND message_id=?',(row['chat_id'],row['id'])).fetchone()
             retry=0
             if prior:
@@ -100,6 +100,29 @@ def discover(db, limit=200):
             db.execute('INSERT OR IGNORE INTO attachment_queue(chat_id,message_id,retry_at) VALUES(?,?,?)',(row['chat_id'],row['id'],retry))
     if rows: db.execute("UPDATE attachment_meta SET value=? WHERE key='discovery_cursor'",(str(rows[-1]['rowid']),))
     db.commit()
+    return len(rows)
+
+
+# Policy (2026-10-14): stickers and documents from large groups or channels are not worth analyzing.
+# Policy (2026-10-15): nothing at all from groups over HUGE_GROUP members or from channels.
+LARGE_GROUP = 50
+HUGE_GROUP = 150
+
+
+# Chats whose title contains any of these (comma-separated, case-insensitive) are always analyzed,
+# whatever their size. Configured per deployment so private chat names stay out of the code.
+EXCEPTIONS = tuple(n.strip().lower() for n in os.environ.get('TG_ATTACHMENT_ALWAYS_ANALYZE', '').split(',') if n.strip())
+
+
+def skipped(db,row):
+    if row['media_type']=='sticker':return True
+    if row['chat_id']>0:return False
+    chat=db.execute('SELECT type,title FROM chats WHERE id=?',(row['chat_id'],)).fetchone()
+    if chat and any(name in (chat['title'] or '').lower() for name in EXCEPTIONS):return False
+    if chat and chat['type']=='channel':return True
+    size=db.execute('SELECT member_count FROM group_monitoring_inventory WHERE chat_id=?',(row['chat_id'],)).fetchone()
+    members=size['member_count'] if size and size['member_count'] else 0
+    return members>HUGE_GROUP or (row['media_type']=='document' and members>LARGE_GROUP)
 
 
 def request_rescan(db, chat_id):
@@ -116,7 +139,7 @@ def drain_rescan(db,limit=200):
     rows=db.execute('SELECT id,deleted,media_type FROM messages WHERE chat_id=? AND id>? ORDER BY id LIMIT ?',
                     (group['chat_id'],group['cursor'],min(200,max(1,limit)))).fetchall()
     for row in rows:
-        if not row['deleted'] and row['media_type'] in ('photo','image','sticker','document'):
+        if not row['deleted'] and row['media_type'] in ('photo','image','document'):
             db.execute('''INSERT INTO attachment_queue(chat_id,message_id) VALUES(?,?)
                 ON CONFLICT(chat_id,message_id) DO UPDATE SET retry_at=0,attempts=0,terminal=0,error=NULL''',(group['chat_id'],row['id']))
     if rows:db.execute('UPDATE attachment_group_rescan SET cursor=? WHERE chat_id=?',(rows[-1]['id'],group['chat_id']))
@@ -140,21 +163,31 @@ def current(db,row):
     return bool(message and not message['deleted'] and message['media_hash'] and message['media_hash']==row['media_hash'] and allowed(db,row['chat_id']))
 
 
+# The backlog is split across parallel workers. TG_ATTACHMENT_SHARD="i/n";
+# only shard 0 discovers new attachments, every shard takes the queue rows where message_id % n == i.
+SHARD, SHARDS = (int(x) for x in os.environ.get('TG_ATTACHMENT_SHARD', '0/1').split('/'))
+
+
 def pending(db,limit=4):
-    discover(db)
-    drain_rescan(db)
+    if SHARD == 0:
+        # Old history is mostly skipped media: scan up to 10k messages per pass instead of 200.
+        for _ in range(50):
+            if discover(db) < 200: break
+        drain_rescan(db)
     # Take bounded queue entries first; excluded/expired groups cannot force a history scan.
     candidates=db.execute('''SELECT m.chat_id,m.id AS message_id,m.media_hash,m.media_size,
         m.media_type,m.media_name AS filename,m.deleted,a.status,a.retry_at,
         q.attempts AS attempts FROM attachment_queue q
         JOIN messages m ON m.chat_id=q.chat_id AND m.id=q.message_id
         LEFT JOIN attachment_analysis a ON a.chat_id=m.chat_id AND a.message_id=m.id
-        WHERE q.terminal=0 AND q.retry_at<=? ORDER BY q.retry_at LIMIT 32''',(time.time(),)).fetchall()
+        WHERE q.terminal=0 AND q.retry_at<=? AND q.message_id%?=? ORDER BY q.retry_at LIMIT 32''',(time.time(),SHARDS,SHARD)).fetchall()
     result=[]
     for candidate in candidates:
         row=dict(candidate)
         if not allowed(db,row['chat_id']):
             db.execute('UPDATE attachment_queue SET retry_at=? WHERE chat_id=? AND message_id=?',(time.time()+300,row['chat_id'],row['message_id']))
+        elif skipped(db,row):
+            db.execute("UPDATE attachment_queue SET terminal=1,error='skipped_by_policy' WHERE chat_id=? AND message_id=?",(row['chat_id'],row['message_id']))
         elif not row['deleted']:
             result.append(row)
             if len(result)>=max(1,min(4,limit)): break
@@ -225,7 +258,8 @@ class Mcp:
 
 
 def run_once(db,mcp,temp_root):
-    for row in pending(db):
+    rows = pending(db)
+    for row in rows:
         try:
             if not allowed(db,row['chat_id']):continue
             if row['media_size'] and row['media_size']>MAX_FILE:
@@ -266,6 +300,7 @@ def run_once(db,mcp,temp_root):
         except Exception as error:
             if not save(db,row,dict(text='',status='failed',reason=type(error).__name__)):
                 record_failure(db,row,type(error).__name__)
+    return len(rows)
 
 
 def main():
@@ -281,7 +316,7 @@ def main():
         print(json.dumps(extract(args.extract,args.filename,args.media_type)));return
     store=Path(os.environ.get('TG_STORE',str(Path.home()/'.local/share/telegram-mcp'))).resolve()
     temp_root=store/'attachment-tmp';temp_root.mkdir(exist_ok=True,mode=0o700)
-    with (temp_root/'worker.lock').open('a') as lock:
+    with (temp_root/('worker.lock' if SHARD == 0 else f'worker-{SHARD}.lock')).open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         for entry in temp_root.glob('tmp*'):
             if entry.is_dir() and not entry.is_symlink() and entry.stat().st_mtime<time.time()-86400:
@@ -290,9 +325,9 @@ def main():
         initialize(db)
         try:
             while True:
-                run_once(db,Mcp(),temp_root)
+                busy = run_once(db,Mcp(),temp_root)
                 if args.once:break
-                time.sleep(30)
+                time.sleep(1 if busy else 30)
         finally:db.close()
 
 if __name__=='__main__':main()

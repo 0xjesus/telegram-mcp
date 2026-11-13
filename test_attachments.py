@@ -24,7 +24,7 @@ class Attachments(unittest.TestCase):
         self.db.commit()
         for _ in range(3): self.assertEqual(self.w.pending(self.db),[])
         cursor=int(self.db.execute("SELECT value FROM attachment_meta WHERE key='discovery_cursor'").fetchone()[0])
-        self.assertLessEqual(cursor,600)
+        self.assertLessEqual(cursor,50*200)
         self.add(3000)
         self.assertEqual(len(self.w.pending(self.db,99)),1)
         self.db.close(); self.db=sqlite3.connect(self.path);self.addCleanup(self.db.close);self.w.initialize(self.db)

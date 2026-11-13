@@ -8,7 +8,7 @@ import zipfile
 
 from tools.attachments.extract import IMAGE_SUFFIXES, MAX_EXPANDED, MAX_PAGES, natural
 
-SEPARATOR = '\n\n[Análisis generado por IA — OpenAI]\n'
+SEPARATOR = '\n\n[Análisis generado por IA — Gemini]\n'
 VERSION = 'openai-v1'
 
 

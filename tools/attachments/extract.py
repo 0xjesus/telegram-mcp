@@ -11,7 +11,6 @@ MAX_FILE = 50 * 1024 * 1024
 MAX_EXPANDED = 100 * 1024 * 1024
 MAX_TEXT = 2_000_000
 MAX_PAGES = 500
-_OCR = None
 
 
 def result(text='', status='done', **metadata):
@@ -73,28 +72,10 @@ def office(path, suffix):
             else:
                 text = paragraphs(root)
             parts.append('[' + name + ']\n' + text)
-        # Pictures embedded in Office files also need OCR; do not silently ignore them.
-        for name in sorted(names, key=natural):
-            if re.match(r'(word|ppt|xl)/media/', name) and Path(name).suffix.lower() in IMAGE_SUFFIXES:
-                from PIL import Image
-                with Image.open(io.BytesIO(archive.read(name))) as image:
-                    parts.append('[' + name + ' OCR]\n' + ocr(image))
+        # Since 2026-10-15: no local OCR at all; embedded pictures are read by the cloud model.
     if not parts:
         return result(status='unsupported', reason='empty_office_container')
-    return result('\n\n'.join(parts), method='office_xml_and_ocr')
-
-
-def ocr(image):
-    global _OCR
-    from PIL import ImageOps
-    import numpy as np
-    from rapidocr_onnxruntime import RapidOCR
-    if _OCR is None:
-        _OCR = RapidOCR(intra_op_num_threads=1, inter_op_num_threads=1)
-    prepared = ImageOps.exif_transpose(image).convert('RGB')
-    prepared.thumbnail((4096, 4096))
-    rows, _ = _OCR(np.asarray(prepared)[:, :, ::-1])
-    return '\n'.join(row[1] for row in (rows or []))
+    return result('\n\n'.join(parts), method='office_xml')
 
 
 def pdf(path):
@@ -110,24 +91,11 @@ def pdf(path):
                     text = textpage.get_text_range()
                 finally:
                     textpage.close()
-                # OCR every page: mixed text/scanned pages otherwise lose embedded text.
-                scale = min(2.5, 4096 / max(page.get_size()))
-                bitmap = page.render(scale=scale)
-                try:
-                    image = bitmap.to_pil()
-                    try:
-                        scanned = ocr(image)
-                    finally:
-                        image.close()
-                finally:
-                    bitmap.close()
-                if scanned and re.sub(r'\s+', '', scanned) != re.sub(r'\s+', '', text):
-                    text += '\n[OCR]\n' + scanned
                 parts.append(f'[Página {number + 1}]\n{text}')
             finally:
                 page.close()
         return result('\n\n'.join(parts), status='partial' if total > MAX_PAGES else 'done',
-                      pages_total=total, pages_processed=min(total, MAX_PAGES), method='pdf_text_and_ocr')
+                      pages_total=total, pages_processed=min(total, MAX_PAGES), method='pdf_text')
 
 
 IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.tif'}
@@ -152,7 +120,7 @@ def extract(path, filename='', media_type='', vision=None):
     if suffix in IMAGE_SUFFIXES or media_type in ('image', 'sticker'):
         from PIL import Image
         with Image.open(path) as image:
-            text = ocr(image)
+            text = ''  # no local OCR; the cloud model reads the image
             parts = ['[Texto de imagen]\n' + text] if text else []
             if vision:
                 parts.append('[Descripción visual generada por IA]\n' + vision(image))

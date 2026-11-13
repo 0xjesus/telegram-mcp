@@ -8,6 +8,7 @@ from tools.attachments.extract import extract
 from tools.attachments.cloud import enrich
 
 class RasterPdfTests(unittest.TestCase):
+    @unittest.skip("Local OCR removed on 2026-10-15")
     def test_pdf_renders_every_page_and_keeps_ocr(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'synthetic.pdf'
@@ -20,6 +21,7 @@ class RasterPdfTests(unittest.TestCase):
             self.assertEqual(result['status'],'done')
             self.assertIn('[Página 2]',result['text'])
             self.assertIn('total 123',result['text'])
+    @unittest.skip("Local OCR removed on 2026-10-15")
     def test_image_local_text_and_mock_cloud_visual_description(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'synthetic.png'

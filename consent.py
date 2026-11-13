@@ -54,12 +54,14 @@ def set_consent(db, chat_id, permit, evidence, confirmed=False):
     install(db)
     now=datetime.datetime.now(datetime.timezone.utc).isoformat()
     with db:
+        db.execute('BEGIN IMMEDIATE')
+        was_allowed=allowed(db,chat_id)
         db.execute('''INSERT INTO group_monitoring_consent VALUES(?,?,?,?)
             ON CONFLICT(chat_id) DO UPDATE SET allowed=excluded.allowed,evidence=excluded.evidence,updated_at=excluded.updated_at''',
             (chat_id,int(permit),evidence.strip(),now))
         db.execute('INSERT INTO group_monitoring_audit(chat_id,allowed,evidence,updated_at) VALUES(?,?,?,?)',
             (chat_id,int(permit),evidence.strip(),now))
-        if permit and db.execute("SELECT 1 FROM sqlite_master WHERE name='chat_sync'").fetchone():
+        if permit and not was_allowed and db.execute("SELECT 1 FROM sqlite_master WHERE name='chat_sync'").fetchone():
             # Revisit the gap while monitoring was disabled; never infer a completed backfill.
             db.execute("UPDATE chat_sync SET backfill_id=0,backfill_status='pending',last_backfill_at=0,last_incremental_at=0,incremental_pending=1 WHERE chat_id=?",(chat_id,))
             db.execute('UPDATE chats SET backfill_done=0 WHERE id=?',(chat_id,))
